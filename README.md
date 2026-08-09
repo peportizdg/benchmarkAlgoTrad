@@ -44,3 +44,8 @@ python -m benchmark.plots convergence \
   propósito para no medir tiempo de cola como si fuera latencia.
 - FIX sobre TLS necesita quickfix compilado con OpenSSL (`build-quickfix-ssl.sh`);
   el wheel de PyPI no lo trae.
+
+
+Google Form de Encuesta a Participantes:
+
+https://docs.google.com/forms/d/1kaf_8kFDIlTTghlc3mvm8uL7yusc2LFVMS6u2fh4fGE/
