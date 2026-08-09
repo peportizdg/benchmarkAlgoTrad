@@ -88,22 +88,31 @@ def _sample(ctx: Ctx, seq: int, is_warmup: int, res: RTResult, t_sched_ns: int) 
 # ---------------------------------------------------------------------------
 
 async def run_closed_loop(session, scenario, ctx: Ctx) -> list:
-    """N workers; cada uno serial. In-flight acotado a concurrency."""
+    """N workers; cada uno serial. In-flight acotado a concurrency.
+
+    El total de mensajes es POR CELDA (warmup + n_messages), repartido entre los
+    `concurrency` workers. Es decir: la cantidad de mensajes NO se multiplica por
+    la concurrencia. Así el volumen (y el tiempo) quedan acotados sin importar el
+    nivel de concurrencia, y se siguen obteniendo ~n_messages muestras útiles.
+    """
     seq = new_seq_counter()
     samples: list = []
-    total = scenario.warmup_messages + scenario.n_messages
+    conc = max(ctx.concurrency, 1)
+    # Reparto (ceil) del total y del warmup entre los workers.
+    per_worker = -(-(scenario.warmup_messages + scenario.n_messages) // conc)
+    warm_per_worker = -(-scenario.warmup_messages // conc)
 
     async def worker():
-        for i in range(total):
+        for i in range(per_worker):
             s = next(seq)
-            is_warmup = 1 if i < scenario.warmup_messages else 0
+            is_warmup = 1 if i < warm_per_worker else 0
             try:
                 res = await session.roundtrip(s, scenario.msg_size)
             except Exception:
                 res = RTResult(0, 0, 0, ok=False)
             samples.append(_sample(ctx, s, is_warmup, res, t_sched_ns=0))
 
-    await asyncio.gather(*(worker() for _ in range(ctx.concurrency)))
+    await asyncio.gather(*(worker() for _ in range(conc)))
     return samples
 
 
