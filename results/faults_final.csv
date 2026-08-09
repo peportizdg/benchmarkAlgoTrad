@@ -1,0 +1,5 @@
+protocol,tls,scenario,repetition,target_rate,msgs_sent,msgs_lost,msgs_recovered,recovery_time_ms,outage_ms
+fix,0,fault_injection,0,1112.96,400,0,210,,3206.0
+http,0,fault_injection,0,123.07,400,210,0,,3310.5
+http2,1,fault_injection,0,144.37,400,210,0,,3312.4
+ws,0,fault_injection,0,2913.93,400,210,0,,3106.6

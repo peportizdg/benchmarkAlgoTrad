@@ -1,0 +1,14 @@
+# Web stack
+fastapi
+uvicorn[standard]
+hypercorn          # servidor ASGI con soporte HTTP/2 (h2 sobre TLS)
+httpx[http2]
+websockets
+
+# FIX
+quickfix
+
+# Analysis / plotting
+numpy
+pandas
+matplotlib

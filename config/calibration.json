@@ -1,0 +1,18 @@
+{
+  "capacity_msg_s": {
+    "fix": 11129.620100224118,
+    "http": 1230.7445253479966,
+    "http2": 1443.7151280740786,
+    "ws": 29139.286186816964
+  },
+  "meta": {
+    "cpu_model": "Intel(R) Core(TM) Ultra 5 125U",
+    "cpu_count": 14,
+    "cpu_governor": "powersave",
+    "cpu_affinity": "0,1,2,3,4,5,6,7,8,9,10,11,12,13",
+    "kernel": "6.18.7-76061807-generic",
+    "python": "3.14.3+",
+    "python_gil": "enabled"
+  },
+  "calibrated_at": "2026-08-09T08:25:10.599319"
+}

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+results/raw_*.csv
+results/meta_*.json
+config/tls/
+fixstore/
+fault_*/
+*.log
