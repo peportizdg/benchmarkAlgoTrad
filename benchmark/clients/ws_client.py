@@ -15,7 +15,7 @@ import ssl
 import websockets
 
 from benchmark.common import build_payload, now_ns, parse_header
-from benchmark.clients.driver import RTResult, result_from_bytes
+from benchmark.clients.driver import RTResult, new_counters, result_from_bytes
 
 
 def _ssl_ctx(tls: bool):
@@ -38,10 +38,14 @@ class WsSession:
         self._alive = False
         self._conn_lock = asyncio.Lock()
         self.echoed_seqs: set[int] = set()  # para conteo de recuperados en fault
+        self.counters = new_counters()
+        self._lost_conn = False
+        self._ssl = _ssl_ctx(tls)  # cargar las CAs cuesta ~70 ms de CPU: una vez por sesión
 
     async def _connect(self):
         return await websockets.connect(
-            self.url, max_size=None, ping_interval=None, ssl=_ssl_ctx(self.tls),
+            self.url, max_size=None, ping_interval=None, ssl=self._ssl,
+            compression=None,  # sin permessage-deflate, como FIX y HTTP
         )
 
     async def _receiver(self):
@@ -53,15 +57,18 @@ class WsSession:
                 if len(msg) < 24:
                     continue
                 seq = parse_header(msg).seq
+                if seq in self.echoed_seqs:
+                    self.counters["dup_delivered"] += 1
                 self.echoed_seqs.add(seq)
                 fut = self._pending.pop(seq, None)
                 if fut is not None and not fut.done():
                     fut.set_result((msg, t_recv))
         except Exception:
-            pass
+            self.counters["transport_errors"] += 1
         finally:
             # Cortó la conexión: fallar todo lo pendiente (mensajes perdidos).
             self._alive = False
+            self._lost_conn = True
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_result((None, 0))
@@ -76,6 +83,9 @@ class WsSession:
                 return
             self._conn = await self._connect()
             self._alive = True
+            self.counters["connects"] += 1
+            if self._lost_conn:
+                self.counters["reconnects"] += 1
             self._recv_task = asyncio.create_task(self._receiver())
 
     async def start(self):
@@ -112,9 +122,11 @@ class WsSession:
                 self._pending.pop(seq, None)
                 return RTResult(0, 0, 0, ok=False)
         else:
+            t_send = now_ns()  # antes del connect, como HTTP: incluye TCP + TLS + handshake
             try:
                 async with await self._connect() as c:
-                    await c.send(build_payload(seq, size))
+                    self.counters["connects"] += 1
+                    await c.send(build_payload(seq, size, t_send))
                     msg = await c.recv()
                     t_recv = now_ns()
                     if isinstance(msg, str):

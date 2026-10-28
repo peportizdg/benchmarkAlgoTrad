@@ -12,7 +12,12 @@ if [[ ! -d .venv ]]; then
   echo "No existe .venv — crealo: python3.14 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt"
   exit 1
 fi
-source .venv/bin/activate
+# Se llama al intérprete del .venv por ruta: el bin/activate quedó con la ruta
+# vieja del repo y, sin esto, `python` resolvía a otro venv del PATH.
+# El .venv es build estándar (con GIL). Si el shell trae PYTHON_GIL=0 heredado
+# del entorno free-threaded de m4ssockets, Python aborta al arrancar. Lo saco.
+unset PYTHON_GIL VIRTUAL_ENV PYTHONHOME PYTHONPATH
+python() { "$PWD/.venv/bin/python" "$@"; }
 
 cmd="${1:-smoke}"
 shift || true

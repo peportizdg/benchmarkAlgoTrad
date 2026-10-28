@@ -21,7 +21,7 @@ import threading
 import quickfix as fix
 
 from benchmark.common import now_ns
-from benchmark.clients.driver import RTResult
+from benchmark.clients.driver import RTResult, new_counters
 from benchmark import fix_config as fc
 
 _FIX_BASE_OVERHEAD = 90  # overhead aprox. de un NewOrderSingle mínimo (bytes)
@@ -37,19 +37,26 @@ class _App(fix.Application):
 
     def onLogon(self, sessionID):  # noqa: N802
         self.s.session_id = sessionID
+        self.s._count("connects")
+        if self.s._had_logout:
+            self.s._count("reconnects")
         self.s._set_logon(True)
 
     def onLogout(self, sessionID):  # noqa: N802
+        self.s._had_logout = True
         self.s._set_logon(False)
 
     def toAdmin(self, message, sessionID):  # noqa: N802
-        pass
+        self.s._count_admin(message, "out")
 
     def fromAdmin(self, message, sessionID):  # noqa: N802
-        pass
+        self.s._count_admin(message, "in")
 
     def toApp(self, message, sessionID):  # noqa: N802
-        pass
+        # QuickFIX llama toApp también al reenviar desde el store (ResendRequest).
+        if _possdup(message):
+            self.s._count("retx_out")
+            self.s._mark_retx(_get(message, fc.TAG_SEQ))
 
     def fromApp(self, message, sessionID):  # noqa: N802
         t_recv = now_ns()
@@ -59,7 +66,14 @@ class _App(fix.Application):
         if seq is None:
             return
         res = RTResult(t_send, t_srv, t_recv, ok=True)
+        if _possdup(message):
+            self.s._count("retx_in")
+            self.s._mark_retx(seq)
         self.s._deliver(seq, res)
+
+
+def _possdup(message) -> bool:
+    return _get(message.getHeader(), 43) == "Y"
 
 
 def _get(message, tag, default=None):
@@ -84,6 +98,31 @@ class FixSession:
         self._logon_event = asyncio.Event()
         self.logged_on = False
         self.echoed_seqs: set[int] = set()
+        self.counters = new_counters()
+        self.retx_seqs: set[int] = set()  # seqs de aplicación que viajaron con PossDupFlag=Y
+        self._had_logout = False
+
+    # --- contadores (se llaman desde el hilo de quickfix y desde el loop) ---
+    def _count(self, key: str, n: int = 1):
+        with self._lock:
+            self.counters[key] += n
+
+    def _mark_retx(self, seq):
+        try:
+            with self._lock:
+                self.retx_seqs.add(int(seq))
+        except (TypeError, ValueError):
+            pass
+
+    def _count_admin(self, message, direction: str):
+        msg_type = _get(message.getHeader(), 35)
+        if msg_type == "2":
+            self._count(f"resend_req_{direction}")
+        elif msg_type == "4" and _get(message, 123) == "Y":
+            begin = int(_get(message.getHeader(), 34, "0"))
+            new_seq = int(_get(message, 36, "0"))
+            self._count(f"gapfill_{direction}")
+            self._count(f"gapfill_{direction}_seqnums", max(new_seq - begin, 0))
 
     # --- puente desde el hilo de quickfix hacia el loop ---
     def _set_logon(self, up: bool):
@@ -105,7 +144,10 @@ class FixSession:
 
     def _resolve(self, seq: str, res: RTResult):
         try:
-            self.echoed_seqs.add(int(seq))
+            iseq = int(seq)
+            if iseq in self.echoed_seqs:
+                self._count("dup_delivered")
+            self.echoed_seqs.add(iseq)
         except (TypeError, ValueError):
             pass
         fut = self._pending.pop(seq, None)

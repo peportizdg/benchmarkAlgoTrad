@@ -18,6 +18,10 @@
 #   sudo ./netem.sh status
 #   sudo ./netem.sh off
 #
+# Sin sudo: `ns` corre un comando dentro de un network namespace propio
+# (unshare -rn), con su propio lo y la misma regla netem. No toca el lo del host.
+#   ./netem.sh ns 5ms 1ms -- ./run.sh full --tag net10ms ...
+#
 # Flujo típico para la tesis:
 #   sudo ./netem.sh on 5ms 1ms
 #   ./run.sh full --tag net5ms
@@ -49,8 +53,22 @@ case "$cmd" in
   status)
     tc qdisc show dev "$DEV"
     ;;
+  ns)
+    delay="${2:?Pasá el delay, ej: 5ms}"
+    jitter="${3:?Pasá el jitter, ej: 1ms}"
+    shift 3
+    [[ "${1:-}" == "--" ]] && shift
+    exec unshare -rn bash -c '
+      set -euo pipefail
+      ip link set lo up
+      tc qdisc add dev lo root netem delay "$1" "$2" distribution normal
+      echo "netem ON (netns) en lo: $(tc qdisc show dev lo)"
+      shift 2
+      "$@"
+      echo "== tc -s qdisc al terminar:"; tc -s qdisc show dev lo' _ "$delay" "$jitter" "$@"
+    ;;
   *)
-    echo "Uso: sudo ./netem.sh {on <delay> [jitter] | off | status}"
+    echo "Uso: sudo ./netem.sh {on <delay> [jitter] | off | status} | ./netem.sh ns <delay> <jitter> -- <cmd...>"
     exit 1
     ;;
 esac

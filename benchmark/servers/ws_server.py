@@ -36,8 +36,9 @@ async def run(host: str, port: int, tls: bool) -> None:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.load_cert_chain(cert, key)
     # max_size=None: sin límite de tamaño de frame (mensajes grandes post-trade).
+    # compression=None: FIX y HTTP no comprimen; el relleno es muy compresible.
     async with websockets.serve(handler, host, port, max_size=None,
-                                ping_interval=None, ssl=ssl_ctx):
+                                ping_interval=None, ssl=ssl_ctx, compression=None):
         await asyncio.Future()  # corre para siempre
 
 

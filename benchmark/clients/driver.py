@@ -64,6 +64,25 @@ def new_seq_counter():
     return itertools.count(0)
 
 
+# Contadores de transporte por sesión (una sesión = una repetición de una celda).
+# Solo incrementos enteros: no tocan los timestamps ni el camino de medición.
+COUNTER_FIELDS = [
+    "connects",             # conexiones/sesiones establecidas (FIX: logons)
+    "reconnects",           # establecidas DESPUÉS de una pérdida de conexión o error de transporte
+    "transport_errors",     # errores de transporte vistos por el cliente
+    "retx_out",             # retransmisiones del cliente (FIX: PossDupFlag=Y salientes; HTTP: reintentos)
+    "retx_in",              # mensajes recibidos con PossDupFlag=Y (FIX)
+    "dup_delivered",        # ecos entregados a la aplicación con un seq ya entregado
+    "gapfill_in", "gapfill_in_seqnums",    # SequenceReset-GapFill recibidos / seqnums que cubren
+    "gapfill_out", "gapfill_out_seqnums",  # idem enviados
+    "resend_req_in", "resend_req_out",     # ResendRequest (35=2) recibidos / enviados
+]
+
+
+def new_counters() -> dict:
+    return dict.fromkeys(COUNTER_FIELDS, 0)
+
+
 def result_from_bytes(echoed: bytes, t_recv_ns: int) -> RTResult:
     """Normaliza el payload binario eco (HTTP/HTTP2/WS) a RTResult."""
     if echoed is None or len(echoed) < 24:
@@ -178,19 +197,24 @@ async def run_open_rate(session, scenario, ctx: Ctx, rate: float,
     tasks: list = []
     mon = asyncio.create_task(monitor()) if abort_on_backlog else None
     t0 = loop.time()
+    t0_ns = now_ns()  # mismo reloj monotónico que loop.time()
     try:
         for i in range(total):
             target = t0 + i * interval
             delay = target - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
+            # sleep() despierta con granularidad de ~1 ms (epoll): dormir hasta 1,5 ms
+            # antes y ceder el loop hasta el instante exacto. El núcleo queda ocupado.
+            if delay > 0.002:
+                await asyncio.sleep(delay - 0.0015)
+            while loop.time() < target:
+                await asyncio.sleep(0)
             if aborted["flag"]:
                 exc = AbortCell(aborted["reason"])
                 exc.samples = samples
                 raise exc
             s = next(seq)
             is_warmup = 1 if i < scenario.warmup_messages else 0
-            t_sched_ns = now_ns()  # instante programado ≈ ahora (schedule fijo)
+            t_sched_ns = t0_ns + round(i * interval * 1e9)  # instante programado
             pending += 1
             tasks.append(asyncio.create_task(fire(s, is_warmup, t_sched_ns)))
         # Drenar respuestas en vuelo con gracia.

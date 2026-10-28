@@ -27,14 +27,14 @@ class CellResult:
 
 
 def build_session(protocol: str, *, port=None, cfg_path=None, tls=False,
-                  persistent=True, concurrency=1, retries=DEFAULT_RETRIES):
+                  persistent=True, concurrency=1, retries=DEFAULT_RETRIES, pool=None):
     if protocol in ("http", "http2"):
         use_tls = tls or protocol == "http2"
         scheme = "https" if use_tls else "http"
         base = f"{scheme}://127.0.0.1:{port}"
         return HttpSession(
             base_url=base, http2=(protocol == "http2"), tls=use_tls,
-            persistent=persistent, concurrency=concurrency, retries=retries,
+            persistent=persistent, concurrency=concurrency, retries=retries, pool=pool,
         )
     if protocol == "ws":
         scheme = "wss" if tls else "ws"

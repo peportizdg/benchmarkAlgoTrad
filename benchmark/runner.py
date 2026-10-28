@@ -26,7 +26,9 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import os
+import statistics
 import socket
 import subprocess
 import sys
@@ -37,7 +39,7 @@ from datetime import datetime
 from benchmark.common import CSV_FIELDS, free_port, host_metadata, now_ns
 from benchmark.scenarios import SCENARIOS, DEFAULT_ORDER, get_scenario, scaled
 from benchmark import fix_config as fc
-from benchmark.clients.driver import Ctx
+from benchmark.clients.driver import COUNTER_FIELDS, Ctx
 from benchmark.clients.engine import build_session, run_cell
 from benchmark.clients import fix_client
 
@@ -153,14 +155,15 @@ def _throughput(samples) -> float:
     return len(useful) / (span / 1e9)
 
 
-def calibrate(protocols, log) -> dict:
-    """Mide la capacidad (msg/s) de cada protocolo saturando en loopback-plain."""
+def calibrate(protocols, log, reps=1) -> tuple[dict, dict]:
+    """Mide la capacidad (msg/s) de cada protocolo saturando en loopback-plain;
+    con reps > 1 devuelve la mediana y los valores por repetición."""
     from dataclasses import replace
 
     base = get_scenario("market_data_tput")
     scen = replace(base, n_messages=CALIB_MESSAGES, warmup_messages=CALIB_WARMUP,
                    concurrency_levels=[CALIB_CONCURRENCY], repetitions=1)
-    cap = {}
+    cap, per_rep = {}, {}
     for proto in protocols:
         port = free_port()
         proc, cfg_init, ready = _start_server(proto, port, tls=False)
@@ -173,31 +176,38 @@ def calibrate(protocols, log) -> dict:
             ctx = Ctx(protocol=proto, scenario=scen.name, mode="throughput",
                       tls=tls_flag, repetition=0, seed=0, concurrency=CALIB_CONCURRENCY,
                       msg_size=scen.msg_size, persistent=1)
-            session = build_session(proto, port=port, cfg_path=cfg_init, tls=False,
-                                    persistent=True, concurrency=CALIB_CONCURRENCY)
-            res = asyncio.run(run_cell(session, scen, ctx))
-            cap[proto] = _throughput(res.samples)
-            log(f"  {proto}: capacidad ≈ {cap[proto]:.0f} msg/s")
+            per_rep[proto] = []
+            for rep in range(reps):
+                session = build_session(proto, port=port, cfg_path=cfg_init, tls=False,
+                                        persistent=True, concurrency=CALIB_CONCURRENCY)
+                res = asyncio.run(run_cell(session, scen, replace(ctx, repetition=rep)))
+                per_rep[proto].append(_throughput(res.samples))
+            cap[proto] = statistics.median(per_rep[proto])
+            log(f"  {proto}: capacidad ≈ {cap[proto]:.0f} msg/s "
+                f"(reps: {', '.join(f'{v:.0f}' for v in per_rep[proto])})")
         finally:
             _stop(proc)
-    return cap
+    return cap, per_rep
 
 
-def load_or_calibrate(protocols, force, log) -> dict:
-    if not force and os.path.exists(CALIB_PATH):
-        with open(CALIB_PATH) as f:
+def load_or_calibrate(protocols, force, log, path=CALIB_PATH, reps=1) -> dict:
+    if not force and os.path.exists(path):
+        with open(path) as f:
             data = json.load(f)
         cap = data.get("capacity_msg_s", {})
         if all(p in cap for p in protocols):
-            log(f"== Calibración cargada de {CALIB_PATH}")
+            log(f"== Calibración cargada de {path}")
             return cap
-    log("== Calibrando capacidad (loopback-plain)...")
-    cap = calibrate(protocols, log)
-    os.makedirs(os.path.dirname(CALIB_PATH), exist_ok=True)
-    with open(CALIB_PATH, "w") as f:
-        json.dump({"capacity_msg_s": cap, "meta": host_metadata(),
+    log(f"== Calibrando capacidad (loopback-plain, {reps} rep., conc {CALIB_CONCURRENCY})...")
+    cap, per_rep = calibrate(protocols, log, reps)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"capacity_msg_s": cap, "capacity_per_rep_msg_s": per_rep,
+                   "rate_fraction": get_scenario("market_data_lat").rate_fraction,
+                   "concurrency": CALIB_CONCURRENCY, "messages": CALIB_MESSAGES,
+                   "warmup": CALIB_WARMUP, "reps": reps, "meta": host_metadata(),
                    "calibrated_at": datetime.now().isoformat()}, f, indent=2)
-    log(f"== Calibración guardada en {CALIB_PATH}")
+    log(f"== Calibración guardada en {path}")
     return cap
 
 
@@ -205,7 +215,18 @@ def load_or_calibrate(protocols, force, log) -> dict:
 # Ejecución de escenarios normales
 # ---------------------------------------------------------------------------
 
-def run_protocol(proto, scenarios, tls, capacity, writer, log):
+def http_pool_size(rate: float, rtt_ms: float) -> int:
+    """Conexiones HTTP/1.1 para open-loop: λ·RTT en vuelo (Little), ×2 de margen
+    para jitter y conexiones nuevas, +2. Sin red emulada queda en 2 (como antes)."""
+    return 2 * math.ceil(rate * rtt_ms / 1000.0) + 2
+
+
+CELL_FIELDS = ["protocol", "scenario", "mode", "tls", "repetition", "concurrency",
+               "msg_size", "persistent", "target_rate"]
+
+
+def run_protocol(proto, scenarios, tls, capacity, writer, log, counters_writer,
+                 rtt_ms=0.0, pools=None):
     port = free_port()
     proc, cfg_init, ready = _start_server(proto, port, tls=tls)
     if not ready:
@@ -222,6 +243,9 @@ def run_protocol(proto, scenarios, tls, capacity, writer, log):
                 if rate <= 0:
                     log(f"  - {proto}/{scen.name}: sin capacidad calibrada, se omite")
                     continue
+            pool = http_pool_size(rate, rtt_ms) if (proto == "http" and rate) else None
+            if pool and pools is not None:
+                pools[f"{proto}/{scen.name}"] = pool
             for conc, persistent in scen.variants():
                 if proto == "fix" and persistent == 0:
                     log(f"  - {proto}/{scen.name} c={conc} persist=0: omitido (FIX)")
@@ -235,10 +259,13 @@ def run_protocol(proto, scenarios, tls, capacity, writer, log):
                               target_rate=(rate or 0.0))
                     session = build_session(proto, port=port, cfg_path=cfg_init,
                                             tls=tls, persistent=bool(persistent),
-                                            concurrency=conc)
+                                            concurrency=conc, pool=pool)
                     res = asyncio.run(run_cell(session, scen, ctx, rate=rate))
                     for s in res.samples:
                         writer.writerow(s.as_row())
+                    counters_writer.writerow({
+                        **{k: getattr(ctx, k) for k in CELL_FIELDS},
+                        "aborted": int(res.aborted), **session.counters})
                     errs = sum(s.error for s in res.samples)
                     note = f" ABORTADA ({res.reason})" if res.aborted else ""
                     log(f"  - {proto}/{scen.name} c={conc} p={persistent} "
@@ -265,6 +292,14 @@ def main():
     p.add_argument("--nmsg", type=int, default=None,
                    help="cap de mensajes útiles por celda (reduce netem; el RTT "
                         "domina, no hacen falta 10k muestras)")
+    p.add_argument("--fix-variant", default=None, choices=sorted(fc.VARIANTS),
+                   help="fault_injection con FIX sin recuperación (revisión)")
+    p.add_argument("--calibration", default=CALIB_PATH, help="archivo de calibración")
+    p.add_argument("--calib-reps", type=int, default=1)
+    p.add_argument("--calibrate-only", action="store_true")
+    p.add_argument("--rtt-ms", type=float, default=0.0,
+                   help="RTT emulado (dimensiona el pool HTTP/1.1 de open-loop)")
+    p.add_argument("--netem", default="", help="regla netem aplicada (solo se registra)")
     p.add_argument("--out", default=RESULTS_DIR)
     p.add_argument("--tag", default=None)
     args = p.parse_args()
@@ -291,37 +326,76 @@ def main():
 
     # Metadatos + sidecar.
     meta = host_metadata()
-    meta.update({"tag": stamp, "tls": bool(args.tls), "quick": args.quick})
-    with open(os.path.join(args.out, f"meta_{stamp}.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    meta.update({"tag": stamp, "tls": bool(args.tls), "quick": args.quick,
+                 "scenarios": scen_names, "reps": args.reps, "nmsg": args.nmsg,
+                 "fix_variant": args.fix_variant, "qdisc_lo": _qdisc("lo"),
+                 "rtt_ms": args.rtt_ms, "netem": args.netem, "versions": _versions(),
+                 "ws_compression": "desactivada (compression=None, cliente y servidor)",
+                 "open_loop_timing": "preciso: sleep hasta 1,5 ms antes + sleep(0) hasta el instante",
+                 "calibration": args.calibration})
+    meta_path = os.path.join(args.out, f"meta_{stamp}.json")
     log(f"== tag={stamp} tls={args.tls} protocolos={protocols}")
     log(f"   host: {meta['cpu_model']} | kernel {meta['kernel']} | "
         f"gov={meta['cpu_governor']} | GIL={meta['python_gil']} | cpus={meta['cpu_affinity']}")
 
     # Calibración si hace falta (algún escenario open_rate).
+    if args.calibrate_only:
+        load_or_calibrate(protocols, True, log, args.calibration, args.calib_reps)
+        return
     needs_calib = any(s.pattern == "open_rate" for s in scenarios)
     capacity = {}
     if needs_calib:
-        capacity = load_or_calibrate(protocols, args.calibrate, log)
+        capacity = load_or_calibrate(protocols, args.calibrate, log, args.calibration,
+                                     args.calib_reps)
+    pools = {}
 
     normal = [s for s in scenarios if not s.fault]
     faults = [s for s in scenarios if s.fault]
 
-    with open(raw_path, "w", newline="") as f:
+    counters_path = os.path.join(args.out, f"counters_{stamp}.csv")
+    with open(raw_path, "w", newline="") as f, open(counters_path, "w", newline="") as cf:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
+        counters_writer = csv.DictWriter(cf, fieldnames=CELL_FIELDS + ["aborted"] + COUNTER_FIELDS)
+        counters_writer.writeheader()
         for proto in protocols:
             if normal:
                 log(f"[{proto}]")
-                run_protocol(proto, normal, args.tls, capacity, writer, log)
+                run_protocol(proto, normal, args.tls, capacity, writer, log, counters_writer,
+                             args.rtt_ms, pools)
         # fault_injection (import diferido para no acoplar).
         if faults:
             from benchmark.fault import run_faults
             run_faults(protocols, faults, args.tls, capacity, writer,
-                       args.out, stamp, log)
+                       args.out, stamp, log, fix_variant=args.fix_variant)
 
+    meta.update({"capacity_msg_s": capacity, "http_pool": pools,
+                 "rates_msg_s": {p: get_scenario("market_data_lat").rate_fraction * c
+                                 for p, c in capacity.items()}})
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
     _write_summary(raw_path, args.out, stamp, meta, log)
     log("== Listo")
+
+
+def _versions() -> dict:
+    from importlib.metadata import PackageNotFoundError, version
+    out = {"python": sys.version.split()[0]}
+    for pkg in ("quickfix", "websockets", "fastapi", "uvicorn", "hypercorn", "httpx",
+                "httpcore", "h2", "numpy", "pandas"):
+        try:
+            out[pkg] = version(pkg)
+        except PackageNotFoundError:
+            out[pkg] = "no instalado"
+    return out
+
+
+def _qdisc(dev) -> str:
+    try:
+        return subprocess.run(["tc", "qdisc", "show", "dev", dev], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def _write_summary(raw_path, out_dir, stamp, meta, log):

@@ -43,18 +43,25 @@ def _trim_for(scenario: str) -> int:
         return 50
 
 
-def _rep_stats(df_rep, metric, trim):
-    """Métricas de UNA repetición de UNA celda."""
-    attempts = len(df_rep)
-    errors = int(df_rep["error"].sum())
-    error_rate = errors / attempts if attempts else 0.0
-
+def useful_samples(df_rep, trim):
+    """Muestras útiles de una repetición: sin warm-up ni errores, ordenadas por
+    instante real de envío (t_send_ns) y sin las primeras `trim`."""
     useful = df_rep[(df_rep["is_warmup"] == 0) & (df_rep["error"] == 0)]
     useful = useful.sort_values("t_send_ns")
     # No descartar más de la cuenta en corridas chicas (protege smokes).
     eff_trim = min(trim, len(useful) // 5) if trim > 0 else 0
     if eff_trim > 0:
         useful = useful.iloc[eff_trim:]
+    return useful
+
+
+def _rep_stats(df_rep, metric, trim):
+    """Métricas de UNA repetición de UNA celda."""
+    attempts = len(df_rep)
+    errors = int(df_rep["error"].sum())
+    error_rate = errors / attempts if attempts else 0.0
+
+    useful = useful_samples(df_rep, trim)
 
     lat = useful[metric].to_numpy(dtype=float)
     lat = lat[~np.isnan(lat)]

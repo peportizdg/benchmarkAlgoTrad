@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
@@ -40,6 +41,7 @@ def main() -> None:
     # y no cerrarla por keep-alive durante la corrida.
     config.h2_max_concurrent_streams = 1024
     config.keep_alive_timeout = 300.0
+    config.keep_alive_max_requests = sys.maxsize  # el default (1000) cierra la conexión
 
     try:
         asyncio.run(serve(app, config))
